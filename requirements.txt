@@ -1,0 +1,7 @@
+notion-client>=1.0.0
+python-dotenv~=1.0.1
+requests~=2.32.3
+httpx~=0.28.1
+typing~=3.7.4.3
+pytest~=8.3.4
+logging~=0.4.9.6
