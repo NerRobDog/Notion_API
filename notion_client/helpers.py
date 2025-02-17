@@ -147,15 +147,34 @@ def is_mention_rich_text_item_response(rich_text: Dict[Any, Any]) -> bool:
     """Возвращает `True`, если `rich_text` является упоминанием."""
     return rich_text.get("type") == "mention"
 
-def validate_notion_id(id: str) -> str:
-    """Проверяет и нормализует ID Notion"""
+
+def validate_notion_id(value: str) -> str:
+    """
+    Проверяет и нормализует ID Notion или извлекает ID из URL.
+
+    Args:
+        value (str): ID Notion или URL страницы/базы данных
+
+    Returns:
+        str: Нормализованный ID Notion
+
+    Raises:
+        ValueError: Если формат ID или URL неверный
+    """
     try:
-        return str(UUID(id.replace("-", "")))
-    except ValueError:
-        raise ValueError(f"Неверный формат ID Notion: {id}")
+        # Пробуем получить ID из URL если передана ссылка
+        if value.startswith(("https://", "http://")):
+            parsed_url = urlparse(value)
+            base_id = parsed_url.path.split("/")[-1]  # Извлекаем последний фрагмент пути
+            clean_id = base_id.split("?")[0]  # Убираем `?v=...`
+            return str(clean_id)
+        # Иначе валидируем как UUID
+        return str(UUID(value.replace("-", "")))
+    except ValueError as e:
+        raise ValueError(f"Неверный формат ID или URL Notion: {value}") from e
 
 def validate_auth_token(token: str) -> str:
     """Проверяет формат токена авторизации"""
-    if not token.startswith(("secret_", "v2_")):
-        raise ValueError("Токен должен начинаться с 'secret_' или 'v2_'")
+    if not token.startswith(("secret_", "v2_", "ntn_")):
+        raise ValueError("Токен должен начинаться с 'secret_' или 'v2_' или 'ntn_'")
     return token

@@ -1,238 +1,250 @@
-# notion_sugar/functional/crud.py
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Generator
-
+from typing import Any, Dict, List, Optional
 from notion_client import Client
 
-
 class DatabaseQuery:
-    """Класс для работы с базами данных Notion.
-
-    Предоставляет fluent interface для выполнения CRUD операций с базами данных Notion.
-    Поддерживает фильтрацию, сортировку, пагинацию и преобразование типов данных.
-
-    Attributes:
-        database_id (str): ID базы данных в Notion
-        client (Client): Экземпляр клиента Notion API
-        _filters (list): Внутренний список фильтров запроса
-        _sorts (list): Внутренний список параметров сортировки
-    """
-
+    """Класс для работы с базами данных Notion."""
+    DEFAULT_PLACEHOLDER = ""
     def __init__(self, database_id: str, client: Client):
         """
-        Args:
-            database_id (str): ID базы данных в Notion
-            client (Client): Экземпляр клиента Notion API
+        Инициализация класса DatabaseQuery.
+
+        :param database_id: Идентификатор базы данных Notion.
+        :param client: Клиент для взаимодействия с API Notion.
         """
         self.database_id = database_id
         self.client = client
-        self._filters = []
-        self._sorts = []
+        self.schema = self._fetch_schema()  # Получаем схему базы
 
-    def first(self) -> Optional[Dict[str, Any]]:
-        """Получить первую запись из результатов запроса.
+    def _fetch_schema(self) -> Dict[str, Any]:
+        """Получает структуру базы данных (доступные поля и их типы)."""
+        try:
+            database_info = self.client.databases.retrieve(database_id=self.database_id)
+            return database_info.get("properties", {})
+        except Exception as e:
+            print(f"❌ Ошибка при получении структуры базы данных: {e}")
+            return {}
 
-        Returns:
-            Optional[Dict[str, Any]]: Первая запись или None, если результаты пусты
-        """
-        results = self.get_rows()
-        return results[0] if results else None
+    def generate_valid_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Формирует корректные данные перед отправкой в Notion."""
+        valid_data = {}
 
-    def count(self) -> int:
-        """Получить количество записей, соответствующих текущему запросу.
+        for field_name, field_value in data.items():
+            if field_name not in self.schema:
+                print(f"⚠️ Поле '{field_name}' отсутствует в базе данных, пропускаем.")
+                continue
 
-        Returns:
-            int: Количество записей
-        """
-        return len(self.get_rows())
+            field_type = self.schema[field_name]["type"]
 
-    def paginate(self, page_size: int = 100) -> Generator[Dict[str, Any], None, None]:
-        """Постраничная итерация по результатам запроса.
+            if field_type == "title":
+                valid_data[field_name] = {"title": [{"text": {"content": str(field_value)}}]}
+            elif field_type == "rich_text":
+                valid_data[field_name] = {"rich_text": [{"text": {"content": str(field_value)}}]}
+            elif field_type == "select":
+                options = self.schema[field_name].get("select", {}).get("options", [])
+                if any(opt["name"] == field_value for opt in options):
+                    valid_data[field_name] = {"select": {"name": field_value}}
+                else:
+                    print(f"⚠️ Значение '{field_value}' не найдено среди допустимых вариантов для '{field_name}', пропускаем.")
+            elif field_type == "multi_select":
+                options = self.schema[field_name].get("multi_select", {}).get("options", [])
+                selected_options = [opt for opt in options if opt["name"] in field_value]
+                if selected_options:
+                    valid_data[field_name] = {"multi_select": [{"name": opt["name"]} for opt in selected_options]}
+                else:
+                    print(f"⚠️ Значения '{field_value}' не соответствуют допустимым вариантам для '{field_name}', пропускаем.")
+            elif field_type == "date":
+                valid_data[field_name] = {"date": {"start": field_value.isoformat() if isinstance(field_value, datetime) else str(field_value)}}
+            elif field_type == "checkbox":
+                valid_data[field_name] = {"checkbox": bool(field_value)}
+            elif field_type == "number":
+                valid_data[field_name] = {"number": float(field_value)}
+            elif field_type == "url":
+                valid_data[field_name] = {"url": str(field_value)}
+            elif field_type == "email":
+                valid_data[field_name] = {"email": str(field_value)}
+            elif field_type == "phone_number":
+                valid_data[field_name] = {"phone_number": str(field_value)}
+            else:
+                print(f"⚠️ Тип '{field_type}' для '{field_name}' пока не поддерживается.")
 
-        Args:
-            page_size (int, optional): Размер страницы. По умолчанию 100.
+        return valid_data
 
-        Yields:
-            Dict[str, Any]: Записи из базы данных
-        """
-        has_more = True
-        next_cursor = None
+    def add_row(self, property_types: Dict[str, str] = None, **kwargs: Any) -> Dict[str, Any]:
+        """Добавление новой записи в базу данных с учетом типов полей."""
+        properties = {}
+        new_fields = {}
 
-        while has_more:
-            response = self.client.databases.query(
-                database_id=self.database_id,
-                start_cursor=next_cursor,
-                page_size=page_size,
-                filter={"and": self._filters} if self._filters else None,
-                sorts=self._sorts or None
-            )
-            yield from response["results"]
-            has_more = response["has_more"]
-            next_cursor = response["next_cursor"]
-
-    def where(self, **kwargs: Any) -> "DatabaseQuery":
-        """Фильтрация записей по условиям.
-
-        Args:
-            **kwargs: Пары ключ-значение для фильтрации
-
-        Returns:
-            DatabaseQuery: Текущий объект для цепочки вызовов
-        """
         for key, value in kwargs.items():
-            filter_type = self._get_filter_type(value)
-            self._filters.append({
-                "property": key,
-                filter_type: self._get_filter_value(value, filter_type)
-            })
-        return self
+            if key in self.schema:
+                properties[key] = self._format_property(self.schema[key]["type"], value)
+            else:
+                field_type = property_types.get(key, "rich_text") if property_types else "rich_text"
+                print(f"⚠️ Добавляем новое свойство '{key}' с типом '{field_type}' в базу данных.")
+                new_fields[key] = field_type
+                properties[key] = self._format_property(field_type, value)
 
-    def order_by(self, field: str, descending: bool = False) -> "DatabaseQuery":
-        """Установка сортировки результатов.
+        if new_fields:
+            self._update_schema(new_fields)
 
-        Args:
-            field (str): Поле для сортировки
-            descending (bool, optional): Направление сортировки. По умолчанию False.
-
-        Returns:
-            DatabaseQuery: Текущий объект для цепочки вызовов
-        """
-        self._sorts.append({
-            "property": field,
-            "direction": "descending" if descending else "ascending"
-        })
-        return self
-
-    def add_row(self, **kwargs: Any) -> Dict[str, Any]:
-        """Добавление новой записи в базу данных.
-
-        Args:
-            **kwargs: Пары ключ-значение для создания записи
-
-        Returns:
-            Dict[str, Any]: Созданная запись
-        """
-        properties = self._prepare_properties(kwargs)
-        return self.client.pages.create(
-            parent={"database_id": self.database_id},
-            properties=properties
-        )
-
-    def update(self, **kwargs: Any) -> List[Dict[str, Any]]:
-        """Обновление записей, соответствующих текущему запросу.
-
-        Args:
-            **kwargs: Пары ключ-значение для обновления
-
-        Returns:
-            List[Dict[str, Any]]: Список обновленных записей
-        """
-        pages = self.get_rows()
-        results = []
-        for page in pages:
-            properties = self._prepare_properties(kwargs)
-            result = self.client.pages.update(
-                page_id=page["id"],
+        try:
+            response = self.client.pages.create(
+                parent={"database_id": self.database_id},
                 properties=properties
             )
-            results.append(result)
-        return results
+            print(f"✅ Новая запись успешно создана: {response['id']}")
+            return response
+        except Exception as e:
+            print(f"❌ Ошибка при добавлении записи: {e}")
+            return {}
+    def _update_schema(self, new_properties: Dict[str, str]):
+        """Добавляет новые свойства в базу данных."""
+        formatted_properties = {}
+        for name, prop_type in new_properties.items():
+            formatted_properties[name] = {"type": prop_type}
 
-    def get_rows(self) -> List[Dict[str, Any]]:
-        """Получение всех записей, соответствующих текущему запросу.
+        try:
+            self.client.databases.update(
+                database_id=self.database_id,
+                properties=formatted_properties
+            )
+            self.schema.update(formatted_properties)
+            print(f"✅ Обновлена схема базы данных с новыми полями: {list(new_properties.keys())}")
+        except Exception as e:
+            print(f"❌ Ошибка при обновлении схемы базы данных: {e}")
 
-        Returns:
-            List[Dict[str, Any]]: Список записей
-        """
-        filter_obj = {"and": self._filters} if self._filters else None
-        return self.client.databases.query(
-            database_id=self.database_id,
-            filter=filter_obj,
-            sorts=self._sorts or None
-        ).get("results", [])
+    def _format_property(self, field_type: str, value: Any) -> Dict[str, Any]:
+        """Форматирует значение в нужный формат перед отправкой в Notion."""
+        if field_type == "title":
+            return {"title": [{"text": {"content": str(value)}}]}
+        elif field_type == "rich_text":
+            return {"rich_text": [{"text": {"content": str(value)}}]}
+        elif field_type == "select":
+            return {"select": {"name": str(value)}}
+        elif field_type == "multi_select":
+            return {"multi_select": [{"name": v} for v in value] if isinstance(value, list) else []}
+        elif field_type == "date":
+            return {"date": {"start": value}}
+        elif field_type == "checkbox":
+            return {"checkbox": bool(value)}
+        elif field_type == "number":
+            return {"number": float(value)}
+        elif field_type == "url":
+            return {"url": str(value)}
+        elif field_type == "email":
+            return {"email": str(value)}
+        elif field_type == "phone_number":
+            return {"phone_number": str(value)}
+        else:
+            return {"rich_text": [{"text": {"content": str(value)}}]}
 
-    def _prepare_properties(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Подготовка свойств для API Notion.
+    def query(self) -> List[Dict[str, Any]]:
+        try:
+            response = self.client.databases.query(database_id=self.database_id)
+            results = response.get("results", [])
 
-        Args:
-            data (Dict[str, Any]): Исходные данные
+            formatted_results = []
+            for entry in results:
+                page_id = entry.get("id", self.DEFAULT_PLACEHOLDER)
 
-        Returns:
-            Dict[str, Any]: Подготовленные свойства
-        """
+                properties = entry.get("properties", {})
+                if not properties:
+                    print(f"⚠️ Пропущена запись {page_id}, так как у неё нет `properties`.")
+                    continue
+
+                title_value = "Без названия"
+                if "Name" in properties and "title" in properties["Name"]:
+                    title_parts = properties["Name"]["title"]
+                    if title_parts:
+                        title_value = title_parts[0].get("text", {}).get("content", "Без названия")
+
+                record_data = {"id": page_id, "title": title_value}
+                for field_name, field_info in self.schema.items():
+                    field_type = field_info["type"]
+                    value = properties.get(field_name, {})
+
+                    if field_type == "title":
+                        record_data[field_name] = title_value
+                    elif field_type == "rich_text":
+                        rich_text_list = value.get("rich_text", [])
+                        content = rich_text_list[0].get("text", {}).get("content") if rich_text_list else None
+                        record_data[field_name] = content if content is not None else self.DEFAULT_PLACEHOLDER
+                    elif field_type == "select":
+                        select_data = value.get("select")
+                        name = select_data.get("name") if select_data else None
+                        record_data[field_name] = name if name is not None else self.DEFAULT_PLACEHOLDER
+                    elif field_type == "multi_select":
+                        multi_select = value.get("multi_select", [])
+                        names = [opt.get("name") for opt in multi_select if opt.get("name")]
+                        record_data[field_name] = names if names else [self.DEFAULT_PLACEHOLDER]
+                    elif field_type == "date":
+                        date_value = value.get("date", {})
+                        start_date = date_value.get("start") if date_value else None
+                        record_data[field_name] = start_date if start_date is not None else self.DEFAULT_PLACEHOLDER
+                    elif field_type == "checkbox":
+                        checkbox = value.get("checkbox")
+                        record_data[field_name] = "✅" if checkbox else "❌"
+                    elif field_type == "number":
+                        number = value.get("number")
+                        record_data[field_name] = number if number is not None else self.DEFAULT_PLACEHOLDER
+                    elif field_type == "url":
+                        url = value.get("url")
+                        record_data[field_name] = url if url is not None else self.DEFAULT_PLACEHOLDER
+                    elif field_type == "email":
+                        email = value.get("email")
+                        record_data[field_name] = email if email is not None else self.DEFAULT_PLACEHOLDER
+                    elif field_type == "phone_number":
+                        phone = value.get("phone_number")
+                        record_data[field_name] = phone if phone is not None else self.DEFAULT_PLACEHOLDER
+                    elif field_type == "people":
+                        people = value.get("people", [])
+                        names = [user.get("name") for user in people if user.get("name")]
+                        record_data[field_name] = names if names else [self.DEFAULT_PLACEHOLDER]
+
+                formatted_results.append(record_data)
+
+            print(f"\n📄 Найдено {len(formatted_results)} записей (исключены записи без `properties`):\n")
+            for record in formatted_results:
+                print(f"🆔 {record['id']} | 📌 {record['title']}")
+                for key, val in record.items():
+                    if key not in ["id", "title"]:
+                        print(f"   🔹 {key}: {val}")
+                print("-" * 40)
+
+            return formatted_results
+
+        except Exception as e:
+            print(f"❌CRUD: Ошибка при получении списка записей: {e}")
+            return []
+
+        except Exception as e:
+            print(f"❌CRUD: Ошибка при получении списка записей: {e}")
+            return []
+
+    def update_row(self, page_id: str, property_types: Dict[str, str] = None, **kwargs: Any) -> Dict[str, Any]:
+        """Обновление записи в базе данных с возможностью добавления новых свойств."""
         properties = {}
-        for key, value in data.items():
-            properties[key] = self._get_property_value(value)
-        return properties
+        new_fields = {}
 
-    def _get_property_value(self, value: Any) -> Dict[str, Any]:
-        """Преобразование значения в формат свойства Notion.
+        for key, value in kwargs.items():
+            if key in self.schema:
+                properties[key] = self._format_property(self.schema[key]["type"], value)
+            else:
+                field_type = property_types.get(key, "rich_text") if property_types else "rich_text"
+                print(f"⚠️ Добавляем новое свойство '{key}' с типом '{field_type}' в базу данных.")
+                new_fields[key] = field_type
+                properties[key] = self._format_property(field_type, value)
 
-        Args:
-            value (Any): Исходное значение
+        if new_fields:
+            self._update_schema(new_fields)
 
-        Returns:
-            Dict[str, Any]: Структура свойства для API Notion
-        """
-        if isinstance(value, str):
-            return {
-                "title" if value == "Name" else "rich_text": [
-                    {"text": {"content": value}}
-                ]
-            }
-        elif isinstance(value, datetime):
-            return {
-                "date": {
-                    "start": value.isoformat()
-                }
-            }
-        elif isinstance(value, bool):
-            return {"checkbox": value}
-        elif isinstance(value, (int, float)):
-            return {"number": value}
-        elif isinstance(value, list):
-            return {"multi_select": [{"name": v} for v in value]}
-        return {"rich_text": [{"text": {"content": str(value)}}]}
-
-    def _get_filter_type(self, value: Any) -> str:
-        """Определение типа фильтра на основе значения.
-
-        Args:
-            value (Any): Значение для фильтрации
-
-        Returns:
-            str: Тип фильтра Notion
-        """
-        if isinstance(value, str):
-            return "rich_text"
-        elif isinstance(value, bool):
-            return "checkbox"
-        elif isinstance(value, (int, float)):
-            return "number"
-        elif isinstance(value, datetime):
-            return "date"
-        elif isinstance(value, list):
-            return "multi_select"
-        return "rich_text"
-
-    def _get_filter_value(self, value: Any, filter_type: str) -> Dict[str, Any]:
-        """Преобразование значения в формат фильтра Notion.
-
-        Args:
-            value (Any): Значение для фильтрации
-            filter_type (str): Тип фильтра
-
-        Returns:
-            Dict[str, Any]: Структура фильтра для API Notion
-        """
-        if filter_type == "rich_text":
-            return {"equals": str(value)}
-        elif filter_type == "checkbox":
-            return {"equals": bool(value)}
-        elif filter_type == "number":
-            return {"equals": float(value)}
-        elif filter_type == "date":
-            return {"equals": value.isoformat()}
-        elif filter_type == "multi_select":
-            return {"contains": value[0] if value else ""}
-        return {"equals": str(value)}
+        try:
+            response = self.client.pages.update(
+                page_id=page_id,
+                properties=properties
+            )
+            print(f"✅ Запись {page_id} успешно обновлена!")
+            return response
+        except Exception as e:
+            print(f"❌ Ошибка при обновлении записи: {e}")
+            return {}
